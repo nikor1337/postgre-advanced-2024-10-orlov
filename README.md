@@ -1,1 +1,1 @@
-# Course repo wor homeworks
+# Course repo for homeworks
