@@ -251,29 +251,88 @@
     # add rows
     source /usr/local/gpdb/greengage_path.sh
 # Замеры
-## Создаем распределенную таблицу с построчным хранением
+## Создаем распределенные таблицы с поколоночным и построчным хранением:
     postgres=# CREATE TABLE events_row (
-            event_id bigserial,
-            event_time timestamp,
-            user_id bigint,
-            data jsonb,
-            PRIMARY KEY (user_id, event_id)
-        );
-### Загружаем данные в таблицу:
-    postgres=# INSERT INTO events (event_time, user_id, data)
-    SELECT NOW(), generate_series(1, 20000000), '{"action": "login"}';
-    INSERT 0 990001
-
-## Создаем распределенную таблицу с построчным хранением
-    postgres=# CREATE TABLE events_column (
-            event_id bigserial,
-            event_time timestamp,
-            user_id bigint,
-            data jsonb)
-            WITH (appendoptimized=true, orientation=column) distributed by (event_time);
+               event_id bigserial,
+               event_time timestamp,
+               user_id bigint,
+               data jsonb
+           ) distributed by (user_id);
     CREATE TABLE
+    postgres=# CREATE TABLE events_column (
+               event_id bigserial,
+               event_time timestamp,
+               user_id bigint,
+               data jsonb 
+           ) WITH (appendoptimized=true, orientation=column) distributed by (user_id);
+    CREATE TABLE
+    postgres=# CREATE TABLE users (
+                   id bigserial, name text
+              ) distributed by (id);
 
-### Загружаем данные в таблицу:
-    postgres=# INSERT INTO events (event_time, user_id, data)
-    SELECT NOW(), generate_series(1, 20000000), '{"action": "login"}';
-    INSERT 0 990001
+### Загружаем данные в таблицы:
+    INSERT INTO events_row (event_time, user_id, data)
+    SELECT NOW(), generate_series(1, 1000000), '{"action": "login"}'; #10х
+    INSERT INTO events_row (event_time, user_id, data)
+    SELECT NOW(), generate_series(1, 1000000), '{"action": "logout"}'; #10х
+    INSERT INTO events_row (event_time, user_id, data)
+    SELECT NOW(), generate_series(1, 1000000), '{"action": "purchase"}'; #10x
+    INSERT INTO events_column (event_time, user_id, data)
+    SELECT NOW(), generate_series(1, 1000000), '{"action": "login"}'; #10х
+    INSERT INTO events_column (event_time, user_id, data)
+    SELECT NOW(), generate_series(1, 1000000), '{"action": "logout"}'; #10х
+    INSERT INTO events_column (event_time, user_id, data)
+    SELECT NOW(), generate_series(1, 1000000), '{"action": "purchase"}'; #10x
+    INSERT INTO users (name)                                                            
+    SELECT 'user' || generate_series(1, 1000000);  #2x
+
+### Размер таблиц:
+      postgres=# \dt+
+                                          List of relations
+       Schema |     Name      | Type  |  Owner  |       Storage        |  Size   | Description 
+      --------+---------------+-------+---------+----------------------+---------+-------------
+       public | events_column | table | gpadmin | append only columnar | 1414 MB | 
+       public | events_row    | table | gpadmin | heap                 | 2334 MB | 
+       public | users          | table | gpadmin | heap                 | 100 MB  | 
+### Тестируем OLAP запросы:
+#### Таблица с поколоночным хранением:
+      postgres=# explain analyze select name, data from users join events_column on users.id = events_column.user_id;
+                                                                 QUERY PLAN                                                                  
+    ---------------------------------------------------------------------------------------------------------------------------------------------
+    Gather Motion 4:1  (slice1; segments: 4)  (cost=0.00..7609.57 rows=30000000 width=35) (actual time=348.296..8171.038 rows=30000000 loops=1)
+      ->  Hash Join  (cost=0.00..4097.32 rows=7500000 width=35) (actual time=383.669..4425.010 rows=7519770 loops=1)
+            Hash Cond: (events_column.user_id = users.id)
+            Extra Text: (seg2)   Hash chain length 1.6 avg, 8 max, using 322700 of 524288 buckets.
+            ->  Seq Scan on events_column  (cost=0.00..690.88 rows=7500000 width=33) (actual time=0.123..824.712 rows=7519770 loops=1)
+            ->  Hash  (cost=437.60..437.60 rows=250000 width=18) (actual time=381.646..381.646 rows=500946 loops=1)
+                  ->  Seq Scan on users  (cost=0.00..437.60 rows=250000 width=18) (actual time=0.010..32.073 rows=500946 loops=1)
+    Planning time: 7.651 ms
+      (slice0)    Executor memory: 296K bytes.
+      (slice1)    Executor memory: 45372K bytes avg x 4 workers, 45372K bytes max (seg0).  Work_mem: 23482K bytes max.
+    Memory used:  128000kB
+    Optimizer: Pivotal Optimizer (GPORCA)
+    Execution time: 9610.229 ms
+    (13 rows)
+   
+    Time: 9618.549 ms
+
+#### Таблица с построчным хранением:
+    postgres=# explain analyze select name, data from users join events_row on users.id = events_row.user_id;
+                                                                    QUERY PLAN                                                                 
+    --------------------------------------------------------------------------------------------------------------------------------------------
+    Gather Motion 4:1  (slice1; segments: 4)  (cost=0.00..1221.53 rows=1000000 width=34) (actual time=444.875..8891.729 rows=32000000 loops=1)
+      ->  Hash Join  (cost=0.00..1107.80 rows=250000 width=34) (actual time=443.495..5014.848 rows=8021088 loops=1)
+            Hash Cond: (events_row.user_id = users.id)
+            Extra Text: (seg2)   Hash chain length 1.6 avg, 8 max, using 322700 of 524288 buckets.
+            ->  Seq Scan on events_row  (cost=0.00..441.73 rows=250000 width=32) (actual time=0.056..1103.788 rows=8021088 loops=1)
+            ->  Hash  (cost=437.60..437.60 rows=250000 width=18) (actual time=443.071..443.071 rows=500946 loops=1)
+                  ->  Seq Scan on users  (cost=0.00..437.60 rows=250000 width=18) (actual time=0.014..32.320 rows=500946 loops=1)
+    Planning time: 5.651 ms
+      (slice0)    Executor memory: 87K bytes.
+      (slice1)    Executor memory: 45132K bytes avg x 4 workers, 45132K bytes max (seg0).  Work_mem: 23482K bytes max.
+    Memory used:  128000kB
+    Optimizer: Pivotal Optimizer (GPORCA)
+    Execution time: 10462.952 ms
+    (13 rows)
+   
+    Time: 10469.081 ms
