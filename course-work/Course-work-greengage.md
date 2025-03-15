@@ -250,6 +250,18 @@
     nano .bashrc
     # add rows
     source /usr/local/gpdb/greengage_path.sh
+
+# В случае перезагрузки хостов на каждом хосте выполнить следующие действия:
+    sudo su - gpadmin
+    sudo mount -w /dev/vdb /data1
+    sudo sysctl -w net.core.rmem_max=26214400
+    sudo sysctl -w net.core.rmem_default=26214400
+    sudo sysctl -w net.core.wmem_max=26214400
+    sudo sysctl -w net.core.wmem_default=26214400
+    sudo ip link set mtu 9000 dev eth0
+## На мастер хосте для проверки состояния кластера:
+    gpstate
+    gpstate -s
 # Замеры
 ## Создаем распределенные таблицы с поколоночным и построчным хранением:
     postgres=# CREATE TABLE events_row (
